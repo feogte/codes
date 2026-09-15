@@ -1,0 +1,42 @@
+# --- РАССЫЛКА ---
+@dp.message(F.text == "Рассылка")
+async def broadcast_cmd(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): 
+        return
+    await state.set_state(Broadcast.text)
+    await m.answer(
+        "📢 <b>Отправьте сообщение для рассылки:</b>\n\n"
+        "Вы можете отправить текст с премиум-эмодзи, форматированием, фото, видео, гифку или стикер."
+    )
+
+@dp.message(Broadcast.text)
+async def broadcast_finish(m: Message, state: FSMContext):
+    await state.clear()
+    
+    conn = await db()
+    users = await all_rows(conn, "SELECT id FROM users")
+    await conn.close()
+    
+    count = 0
+    blocked = 0
+    
+    status_msg = await m.answer("⏳ Рассылка запущена...")
+    
+    for u in users:
+        try:
+            # copy_message копирует сообщение 1 в 1 со всеми эмодзи, медиа и стилями
+            await bot.copy_message(
+                chat_id=u["id"],
+                from_chat_id=m.chat.id,
+                message_id=m.message_id
+            )
+            count += 1
+            await asyncio.sleep(0.05)  # Задержка, чтобы не превышать лимиты Telegram API
+        except Exception:
+            blocked += 1
+            
+    await status_msg.edit_text(
+        f"✅ <b>Рассылка завершена!</b>\n\n"
+        f"👤 Успешно доставлено: <b>{count}</b>\n"
+        f"🚫 Не доставлено (бот заблокирован): <b>{blocked}</b>"
+    )
