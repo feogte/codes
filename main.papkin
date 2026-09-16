@@ -1,0 +1,369 @@
+import asyncio
+import logging
+import os
+import re
+import sqlite3
+from datetime import datetime
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from dotenv import load_dotenv
+from pyrogram import Client
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("shop_bot")
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+API_ID = os.getenv("API_ID", "123456")  # API ID от my.telegram.org
+API_HASH = os.getenv("API_HASH", "YOUR_API_HASH")  # API Hash от my.telegram.org
+
+DB_PATH = "shop_bot.sqlite3"
+SESSIONS_DIR = "sessions"
+os.makedirs(SESSIONS_DIR, exist_ok=True)
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with get_db() as conn:
+        # Таблица пользователей
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                referrer_id INTEGER,
+                last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        # Таблица аккаунтов (сессий)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                session_path TEXT NOT NULL,
+                is_sold INTEGER DEFAULT 0,
+                buyer_id INTEGER DEFAULT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.commit()
+
+
+def save_user(user_id: int, username: str, first_name: str, referrer_id: int = None):
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (id, username, first_name, referrer_id, last_seen_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+                username=excluded.username,
+                first_name=excluded.first_name,
+                last_seen_at=CURRENT_TIMESTAMP
+            """,
+            (user_id, username, first_name, referrer_id),
+        )
+
+
+def add_account_to_db(title: str, phone: str, session_path: str):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO accounts (title, phone, session_path) VALUES (?, ?, ?)",
+            (title, phone, session_path),
+        )
+
+
+def get_available_accounts():
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT * FROM accounts WHERE is_sold = 0"
+        ).fetchall()
+
+
+def get_account_by_id(acc_id: int):
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT * FROM accounts WHERE id = ?", (acc_id,)
+        ).fetchone()
+
+
+def mark_account_sold(acc_id: int, buyer_id: int):
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE accounts SET is_sold = 1, buyer_id = ? WHERE id = ?",
+            (buyer_id, acc_id),
+        )
+# ==============================================================================
+# FSM СОСТОЯНИЯ И АДМИН-ПАНЕЛЬ
+# ==============================================================================
+
+ADMIN_IDS = [123456789]  # Укажи сюда свой Telegram ID
+
+router = Router()
+
+
+class AddAccountState(StatesGroup):
+    waiting_for_title = State()
+    waiting_for_file = State()
+    waiting_for_phone = State()
+
+
+# Команда для запуска добавления товара
+@router.message(Command("add_account"))
+async def cmd_add_account(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return await message.answer("⛔ У вас нет прав администратора.")
+
+    await state.set_state(AddAccountState.waiting_for_title)
+    await message.answer("📝 Введите **название** для аккаунта (например: *Аккаунт РФ #1*):")
+
+
+# 1. Получаем название
+@router.message(AddAccountState.waiting_for_title)
+async def process_title(message: Message, state: FSMContext):
+    await state.update_data(title=message.text.strip())
+    await state.set_state(AddAccountState.waiting_for_file)
+    await message.answer("📂 Отправьте `.session` файл этого аккаунта:")
+
+
+# 2. Получаем файл
+@router.message(AddAccountState.waiting_for_file, F.document)
+async def process_file(message: Message, state: FSMContext, bot: Bot):
+    document = message.document
+    if not document.file_name.endswith(".session"):
+        return await message.answer("❌ Файл должен быть формата `.session`! Попробуйте ещё раз.")
+
+    # Сохраняем файл сессии на диск
+    file_path = os.path.join(SESSIONS_DIR, f"{document.file_id}.session")
+    file = await bot.get_file(document.file_id)
+    await bot.download_file(file.file_path, destination=file_path)
+
+    await state.update_data(session_path=file_path)
+    await state.set_state(AddAccountState.waiting_for_phone)
+    await message.answer("📱 Введите **номер телефона** аккаунта (в формате `+79XXXXXXXXX`):")
+
+
+# 3. Получаем номер и сохраняем всё в БД
+@router.message(AddAccountState.waiting_for_phone)
+async def process_phone(message: Message, state: FSMContext):
+    phone = message.text.strip()
+    data = await state.get_data()
+
+    add_account_to_db(
+        title=data["title"],
+        phone=phone,
+        session_path=data["session_path"]
+    )
+
+    await state.clear()
+    await message.answer(
+        f"✅ **Аккаунт успешно добавлен!**\n\n"
+        f"📌 Название: `{data['title']}`\n"
+        f"📱 Номер: `{phone}`"
+    )
+# ==============================================================================
+# ПОЛЬЗОВАТЕЛЬСКАЯ ЧАСТЬ И КНОПКА «ЗАБРАТЬ АККАУНТ»
+# ==============================================================================
+
+# Команда /start
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    save_user(
+        user_id=message.from_user.id,
+        username=message.from_user.username,
+        first_name=message.from_user.first_name,
+    )
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🛒 Каталог аккаунтов", callback_data="catalog")]
+        ]
+    )
+    await message.answer(
+        f"Привет, {message.from_user.first_name}! Добро пожаловать в магазин аккаунтов.",
+        reply_markup=keyboard,
+    )
+
+
+# Отображение списка доступных аккаунтов
+@router.callback_query(F.data == "catalog")
+async def show_catalog(callback: CallbackQuery):
+    accounts = get_available_accounts()
+    
+    if not accounts:
+        return await callback.message.edit_text(
+            "😔 В наличии пока нет свободных аккаунтов.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🔄 Обновить", callback_data="catalog")]]
+            )
+        )
+
+    buttons = []
+    for acc in accounts:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"📱 {acc['title']} ({acc['phone']})", 
+                callback_data=f"buy_{acc['id']}"
+            )
+        ])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await callback.message.edit_text("📱 Выберите доступный аккаунт:", reply_markup=keyboard)
+
+
+# Подтверждение и кнопка «Забрать аккаунт»
+@router.callback_query(F.data.startswith("buy_"))
+async def process_buy_click(callback: CallbackQuery):
+    acc_id = int(callback.data.split("_")[1])
+    acc = get_account_by_id(acc_id)
+
+    if not acc or acc["is_sold"]:
+        return await callback.answer("❌ Этот аккаунт уже забрали или он недоступен!", show_alert=True)
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📥 Забрать аккаунт", callback_data=f"claim_{acc['id']}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog")]
+        ]
+    )
+
+    await callback.message.edit_text(
+        f"📌 **Аккаунт:** {acc['title']}\n"
+        f"📱 **Номер:** `{acc['phone']}`\n\n"
+        f"Нажмите кнопку ниже, чтобы получить этот аккаунт и запустился автоматический ожидатель SMS-кода.",
+        reply_markup=keyboard,
+    )
+# ==============================================================================
+# АВТОВЫДАЧА И ПЕРЕХВАТ SMS-КОДА (PYROGRAM)
+# ==============================================================================
+
+async def listen_for_telegram_code(bot: Bot, buyer_id: int, phone: str, session_path: str):
+    """
+    Запускает Pyrogram клиент в фоновом режиме, ждет входящий код от Telegram (777000)
+    и отправляет его покупателю.
+    """
+    # Удаляем расширение .session из пути, так как Pyrogram принимает путь без него
+    session_name = session_path.replace(".session", "")
+    
+    app = Client(
+        session_name,
+        api_id=int(API_ID),
+        api_hash=API_HASH
+    )
+
+    try:
+        await app.start()
+        
+        # Ждём сообщения от официального сервисного аккаунта Telegram (ID 777000)
+        max_checks = 60  # Проверяем в течение ~5 минут (60 раз по 5 секунд)
+        for _ in range(max_checks):
+            await asyncio.sleep(5)
+            
+            # Получаем историю сообщений от Telegram
+            async for message in app.get_chat_history(777000, limit=1):
+                if message and message.text:
+                    # Ищем цифры кода из сообщения (например, 5-значный код)
+                    code_match = re.search(r'\b\d{5,6}\b', message.text)
+                    if code_match:
+                        code = code_match.group(0)
+                        await bot.send_message(
+                            buyer_id,
+                            f"📩 **Получен код подтверждения!**\n\n"
+                            f"📱 Номер: `{phone}`\n"
+                            f"🔑 Ваш код: `{code}`\n\n"
+                            f"💬 Полный текст: `{message.text}`"
+                        )
+                        await app.stop()
+                        return
+
+        # Если за 5 минут код не пришёл
+        await bot.send_message(
+            buyer_id,
+            f"⏰ Время ожидания кода для номера `{phone}` истекло. Если код придет позже, запросите повторно."
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при прослушивании сессии {phone}: {e}")
+        await bot.send_message(buyer_id, f"⚠️ Произошла ошибка при получении кода для `{phone}`.")
+    finally:
+        if app.is_connected:
+            await app.stop()
+
+
+# Обработчик нажатия на «Забрать аккаунт»
+@router.callback_query(F.data.startswith("claim_"))
+async def process_claim_account(callback: CallbackQuery, bot: Bot):
+    acc_id = int(callback.data.split("_")[1])
+    acc = get_account_by_id(acc_id)
+
+    if not acc or acc["is_sold"]:
+        return await callback.answer("❌ Этот аккаунт уже забрали!", show_alert=True)
+
+    # Маркируем аккаунт как проданный за текущим пользователем
+    mark_account_sold(acc_id=acc_id, buyer_id=callback.from_user.id)
+
+    await callback.message.edit_text(
+        f"✅ **Вы успешно забрали аккаунт!**\n\n"
+        f"📱 **Ваш номер:** `{acc['phone']}`\n\n"
+        f"⏳ Введите этот номер в приложении Telegram.\n"
+        f"Как только Telegram отправит SMS, **код автоматически придет в этот чат**."
+    )
+
+    # Запускаем фоновую задачу ожидания SMS
+    asyncio.create_task(
+        listen_for_telegram_code(
+            bot=bot,
+            buyer_id=callback.from_user.id,
+            phone=acc["phone"],
+            session_path=acc["session_path"]
+        )
+    )
+# ==============================================================================
+# ТОЧКА ВХОДА И ЗАПУСК БОТА
+# ==============================================================================
+
+async def main():
+    # Создаём БД и таблицы, если их нет
+    logger.info("Инициализация базы данных...")
+    init_db()
+
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+
+    # Подключаем роутер с хэндлерами
+    dp.include_router(router)
+
+    logger.info("Бот с автовыдачей кодов успешно запущен!")
+    
+    # Запуск polling
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен!")
