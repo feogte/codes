@@ -1,0 +1,1710 @@
+from __future__ import annotations
+
+import asyncio
+import html
+import logging
+import re
+import sqlite3
+from datetime import date, datetime, time, timezone
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    BotCommand,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+
+# ==============================================================================
+# НАСТРОЙКИ
+# ==============================================================================
+
+BOT_TOKEN = "8829688999:AAEK3wEmNOfh6T0Bi4GU5J7Rh5kN6B75aKs"
+OWNER_ID = 8605504295
+
+REVIEWS_CHANNEL_URL = "https://t.me/repaapapkina"
+SUPPORT_USERNAME = "PAPKIH8"
+
+T_BANK_CARD_NUMBER = "2204320382517870"
+T_BANK_RECIPIENT = ""
+T_BANK_NAME = "Озон банк"
+
+STARS_RECEIVER_USERNAME = "PAPKIH8"
+TIMEZONE_NAME = "Europe/Riga"
+
+DB_PATH = Path(__file__).with_name("shop_bot.sqlite3")
+
+SEED_PRODUCTS = [
+    ("accounts", "ru", "🇷🇺 Россия", 60, 60, 48, 1),
+    ("accounts", "kz", "🇰🇿 Казахстан", 60, 60, 16, 1),
+    ("accounts", "ua", "🇺🇦 Украина", 60, 60, 5, 1),
+]
+
+# ==============================================================================
+# ЛОГИРОВАНИЕ И МИДДЛВАРЬ
+# ==============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("shop_bot")
+
+TZ = ZoneInfo(TIMEZONE_NAME)
+
+REQUIRED_CHANNEL_ID = -1003751011129
+REQUIRED_CHANNEL_URL = "https://t.me/metovskiublog"
+
+async def is_subscribed(bot, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(REQUIRED_CHANNEL_ID, user_id)
+        return member.status not in ("left", "kicked")
+    except Exception:
+        return False
+
+
+class SubscriptionGateMiddleware:
+    def __init__(self, bot):
+        self.bot = bot
+
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        callback_data = getattr(event, "data", None)
+
+        if callback_data == "check_subscription":
+            return await handler(event, data)
+
+        if user and not await is_subscribed(self.bot, user.id):
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📢 Подписаться", url=REQUIRED_CHANNEL_URL)],
+                [InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_subscription")]
+            ])
+            text_msg = "🔒 Для использования бота необходимо быть подписанным на канал."
+
+            if isinstance(event, CallbackQuery):
+                await event.answer()
+                await event.message.answer(text_msg, reply_markup=kb)
+            elif isinstance(event, Message):
+                await event.answer(text_msg, reply_markup=kb)
+
+            return
+
+        return await handler(event, data)
+
+
+router = Router()
+
+CATEGORY_TITLES = {
+    "accounts": "🛒 Купить аккаунты",
+    "stars": "⭐ Купить Stars",
+    "premium": "💎 Купить Premium",
+}
+
+ORDER_STATUS_LABELS = {
+    "pending": "⏳ Ожидает решения",
+    "approved": "✅ Выдан",
+    "cancelled": "❌ Отменён",
+}
+
+PAYMENT_METHOD_LABELS = {
+    "card": "₽ Рубли — оплата на карту",
+    "stars": "⭐ Оплата Telegram Stars",
+}
+
+STAR_DELIVERY_LABELS = {
+    "gift": "🎁 Подарком",
+    "account": "👤 На аккаунт",
+    "standard": "—",
+}
+
+# ==============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ==============================================================================
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+async def safe_edit_text(
+    message: Message,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> bool:
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+        return True
+    except TelegramBadRequest as error:
+        if "message is not modified" in str(error).lower():
+            return False
+        raise
+
+
+def local_now() -> datetime:
+    return datetime.now(TZ)
+
+
+def today_utc_bounds() -> tuple[str, str]:
+    current_date = local_now().date()
+    start_local = datetime.combine(current_date, time.min, tzinfo=TZ)
+    end_local = datetime.combine(current_date, time.max, tzinfo=TZ)
+    return (
+        start_local.astimezone(timezone.utc).isoformat(timespec="seconds"),
+        end_local.astimezone(timezone.utc).isoformat(timespec="seconds"),
+    )
+
+
+def format_datetime(value: str | None) -> str:
+    if not value:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(TZ).strftime("%d.%m.%Y %H:%M")
+    except ValueError:
+        return value
+
+
+def money(value: int) -> str:
+    return f"{int(value):,}".replace(",", " ") + " ₽"
+
+
+def stars(value: int) -> str:
+    return f"{int(value):,}".replace(",", " ") + " ⭐"
+
+
+def format_prices(price_rub: int, price_stars: int) -> str:
+    parts: list[str] = []
+    if price_rub > 0:
+        parts.append(money(price_rub))
+    if price_stars > 0:
+        parts.append(stars(price_stars))
+    return " / ".join(parts) if parts else "Бесплатно"
+
+
+def product_prices(product: sqlite3.Row) -> str:
+    return format_prices(int(product["price_rub"]), int(product["price_stars"]))
+
+
+def order_amount(order: sqlite3.Row) -> str:
+    if order["payment_method"] == "stars":
+        return stars(int(order["final_price_stars"]))
+    return money(int(order["final_price_rub"]))
+
+
+def parse_prices(value: str) -> tuple[int, int] | None:
+    normalized = value.strip().lower().replace("ё", "е")
+    numbers = re.findall(r"\d+", normalized)
+    if "/" in normalized:
+        if len(numbers) != 2:
+            return None
+        return int(numbers[0]), int(numbers[1])
+    if len(numbers) == 1:
+        return int(numbers[0]), 0
+    return None
+
+
+def parse_quantity(value: str) -> int | None:
+    match = re.fullmatch(r"\s*(\d+)\s*(?:шт\.?|штук[аи]?)?\s*", value.lower())
+    return int(match.group(1)) if match else None
+
+
+def parse_quick_product_line(value: str) -> tuple[str, int, int, int, str] | None:
+    parts = [part.strip() for part in value.split("|")]
+    if len(parts) < 3 or len(parts) > 4 or not parts[0] or len(parts[0]) > 100:
+        return None
+    parsed_prices = parse_prices(parts[1])
+    stock = parse_quantity(parts[2])
+    item_content = parts[3] if len(parts) == 4 else ""
+    if parsed_prices is None or stock is None:
+        return None
+    price_rub, price_stars = parsed_prices
+    return parts[0], price_rub, price_stars, stock, item_content
+
+
+def normalize_star_delivery(value: str) -> str | None:
+    normalized = value.strip().lower().replace("ё", "е")
+    normalized = re.sub(r"\s+", " ", normalized)
+    if normalized in {"подарком", "подарок", "gift", "через подарок"}:
+        return "gift"
+    if normalized in {"на аккаунт", "аккаунт", "fragment", "через fragment", "на акк"}:
+        return "account"
+    return None
+
+
+def parse_star_amount(value: str) -> int | None:
+    normalized = value.strip().lower().replace("ё", "е")
+    match = re.fullmatch(r"\s*(\d+)\s*(?:⭐|stars?|звезд[аы]?|звезд|шт\.?)?\s*", normalized)
+    if not match:
+        return None
+    amount = int(match.group(1))
+    return amount if amount > 0 else None
+
+
+def parse_stars_product_line(value: str) -> tuple[int, int, int, str] | None:
+    parts = [part.strip() for part in value.split("|")]
+    if len(parts) == 3:
+        package_amount = parse_star_amount(parts[0])
+        prices = parse_prices(parts[1])
+        stock = package_amount
+        delivery_method = normalize_star_delivery(parts[2])
+    elif len(parts) == 4:
+        package_amount = parse_star_amount(parts[0])
+        prices = parse_prices(parts[1])
+        stock = parse_star_amount(parts[2])
+        delivery_method = normalize_star_delivery(parts[3])
+    else:
+        return None
+    if package_amount is None or prices is None or stock is None or delivery_method is None:
+        return None
+    price_rub, _ = prices
+    if price_rub <= 0 or stock < package_amount:
+        return None
+    return package_amount, price_rub, stock, delivery_method
+
+
+def product_unit_amount(product: sqlite3.Row) -> int:
+    try:
+        return max(1, int(product["unit_amount"]))
+    except (IndexError, KeyError, TypeError, ValueError):
+        return 1
+
+
+def product_available(product: sqlite3.Row) -> int:
+    return max(0, int(product["available"]))
+
+
+def product_can_buy(product: sqlite3.Row) -> bool:
+    return product_available(product) >= product_unit_amount(product)
+
+
+def delivery_label(value: str | None) -> str:
+    return STAR_DELIVERY_LABELS.get(value or "standard", html.escape(value or "—"))
+
+
+def stock_label(product: sqlite3.Row, value: int | None = None) -> str:
+    amount = product_available(product) if value is None else max(0, int(value))
+    if product["category"] == "stars":
+        return stars(amount)
+    return f"{amount} шт."
+
+
+def safe_username(username: str | None, user_id: int) -> str:
+    if username:
+        return f"@{html.escape(username)}"
+    return f"<code>{user_id}</code>"
+
+
+def valid_tme_url(url: str) -> bool:
+    return bool(re.fullmatch(r"https://t\.me/[A-Za-z0-9_+\-/]+", url.strip()))
+
+
+def category_title(category: str) -> str:
+    return CATEGORY_TITLES.get(category, f"📁 {html.escape(category)}")
+
+
+def main_menu_keyboard(show_admin: bool = False) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text="🛒 Купить аккаунты"), KeyboardButton(text="⭐ Купить Stars")],
+        [KeyboardButton(text="💎 Купить Premium")],
+        [KeyboardButton(text="📝 Отзывы"), KeyboardButton(text="👨‍💻 Поддержка")],
+    ]
+    if show_admin:
+        rows.append([KeyboardButton(text="⚙️ Админ-панель")])
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        input_field_placeholder="Выберите раздел",
+    )
+
+
+def admin_menu_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📦 Склад и товары", callback_data="admin:stock")
+    builder.button(text="📊 Статистика", callback_data="admin:stats")
+    builder.button(text="📜 История заказов", callback_data="admin:history:0")
+    builder.button(text="🎟 Промокоды", callback_data="admin:promos")
+    builder.button(text="📣 Рассылка", callback_data="admin:broadcast")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_ID
+# ==============================================================================
+# БАЗА ДАННЫХ И ИНИЦИАЛИЗАЦИЯ
+# ==============================================================================
+
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                subcategory TEXT NOT NULL,
+                title TEXT NOT NULL,
+                price_rub INTEGER NOT NULL,
+                price_stars INTEGER NOT NULL,
+                available INTEGER NOT NULL,
+                unit_amount INTEGER NOT NULL DEFAULT 1,
+                star_delivery_method TEXT DEFAULT 'standard',
+                item_content TEXT DEFAULT ''
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS promo_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                discount_percent INTEGER NOT NULL,
+                max_uses INTEGER NOT NULL,
+                current_uses INTEGER NOT NULL DEFAULT 0,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                user_display TEXT NOT NULL,
+                category TEXT NOT NULL,
+                product_id INTEGER,
+                product_title TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                payment_method TEXT NOT NULL,
+                original_price_rub INTEGER NOT NULL,
+                original_price_stars INTEGER NOT NULL,
+                final_price_rub INTEGER NOT NULL,
+                final_price_stars INTEGER NOT NULL,
+                promo_code TEXT,
+                status TEXT NOT NULL,
+                details TEXT NOT NULL,
+                item_content TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        # Миграция поля item_content, если БД уже создана
+        cursor.execute("PRAGMA table_info(products)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "item_content" not in columns:
+            cursor.execute("ALTER TABLE products ADD COLUMN item_content TEXT DEFAULT ''")
+
+        cursor.execute("PRAGMA table_info(orders)")
+        order_columns = [row[1] for row in cursor.fetchall()]
+        if "item_content" not in order_columns:
+            cursor.execute("ALTER TABLE orders ADD COLUMN item_content TEXT DEFAULT ''")
+
+        # Начальное заполнение товарами
+        cursor.execute("SELECT COUNT(*) AS count FROM products")
+        if cursor.fetchone()["count"] == 0:
+            for cat, sub, title, rub, star, stock, unit in SEED_PRODUCTS:
+                cursor.execute(
+                    """
+                    INSERT INTO products (
+                        category, subcategory, title, price_rub, price_stars, available, unit_amount, star_delivery_method, item_content
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'standard', '')
+                    """,
+                    (cat, sub, title, rub, star, stock, unit),
+                )
+        conn.commit()
+
+
+def save_user(user_id: int, username: str | None, first_name: str) -> None:
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (user_id, username, first_name, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name
+            """,
+            (user_id, username, first_name, utc_now_iso()),
+        )
+
+
+def get_products(category: str) -> list[sqlite3.Row]:
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT * FROM products WHERE category = ? ORDER BY id ASC",
+            (category,),
+        ).fetchall()
+
+
+def get_product(product_id: int) -> sqlite3.Row | None:
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT * FROM products WHERE id = ?",
+            (product_id,),
+        ).fetchone()
+
+
+def update_product_stock(product_id: int, new_stock: int) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE products SET available = ? WHERE id = ?",
+            (max(0, new_stock), product_id),
+        )
+
+
+def set_product_prices(product_id: int, rub: int, stars_cnt: int) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE products SET price_rub = ?, price_stars = ? WHERE id = ?",
+            (max(0, rub), max(0, stars_cnt), product_id),
+        )
+
+
+def delete_product(product_id: int) -> None:
+    with get_db() as conn:
+        conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
+
+
+def get_promo(code: str) -> sqlite3.Row | None:
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT * FROM promo_codes WHERE code = ? AND is_active = 1",
+            (code.strip().upper(),),
+        ).fetchone()
+
+
+def get_all_promos() -> list[sqlite3.Row]:
+    with get_db() as conn:
+        return conn.execute("SELECT * FROM promo_codes ORDER BY id DESC").fetchall()
+
+
+def create_promo(code: str, discount: int, max_uses: int) -> bool:
+    try:
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO promo_codes (code, discount_percent, max_uses, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (code.strip().upper(), discount, max_uses, utc_now_iso()),
+            )
+            return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def toggle_promo_status(promo_id: int) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE promo_codes SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE id = ?",
+            (promo_id,),
+        )
+
+
+def create_order(
+    user_id: int,
+    user_display: str,
+    category: str,
+    product_id: int | None,
+    product_title: str,
+    quantity: int,
+    payment_method: str,
+    orig_rub: int,
+    orig_stars: int,
+    final_rub: int,
+    final_stars: int,
+    promo_code: str | None,
+    details: str,
+    item_content: str = "",
+) -> int:
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO orders (
+                user_id, user_display, category, product_id, product_title,
+                quantity, payment_method, original_price_rub, original_price_stars,
+                final_price_rub, final_price_stars, promo_code, status, details, item_content, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            (
+                user_id,
+                user_display,
+                category,
+                product_id,
+                product_title,
+                quantity,
+                payment_method,
+                orig_rub,
+                orig_stars,
+                final_rub,
+                final_stars,
+                promo_code,
+                details,
+                item_content,
+                utc_now_iso(),
+            ),
+        )
+        order_id = cursor.lastrowid
+        if promo_code:
+            cursor.execute(
+                "UPDATE promo_codes SET current_uses = current_uses + 1 WHERE code = ?",
+                (promo_code,),
+            )
+        return order_id
+
+
+def get_order(order_id: int) -> sqlite3.Row | None:
+    with get_db() as conn:
+        return conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+
+
+def update_order_status(order_id: int, status: str) -> None:
+    with get_db() as conn:
+        conn.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
+
+
+def get_orders_page(page: int = 0, limit: int = 5) -> tuple[list[sqlite3.Row], int]:
+    with get_db() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        orders = conn.execute(
+            "SELECT * FROM orders ORDER BY id DESC LIMIT ? OFFSET ?",
+            (limit, page * limit),
+        ).fetchall()
+        return orders, total
+
+
+def get_statistics() -> dict[str, Any]:
+    with get_db() as conn:
+        start_utc, end_utc = today_utc_bounds()
+
+        users_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+        total_orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        approved_orders = conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE status = 'approved'"
+        ).fetchone()[0]
+
+        rev_rub = conn.execute(
+            "SELECT SUM(final_price_rub) FROM orders WHERE status = 'approved'"
+        ).fetchone()[0] or 0
+
+        rev_stars = conn.execute(
+            "SELECT SUM(final_price_stars) FROM orders WHERE status = 'approved'"
+        ).fetchone()[0] or 0
+
+        today_orders = conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE created_at >= ? AND created_at <= ?",
+            (start_utc, end_utc),
+        ).fetchone()[0]
+
+        today_approved = conn.execute(
+            """
+            SELECT COUNT(*) FROM orders 
+            WHERE status = 'approved' AND created_at >= ? AND created_at <= ?
+            """,
+            (start_utc, end_utc),
+        ).fetchone()[0]
+
+        today_rub = conn.execute(
+            """
+            SELECT SUM(final_price_rub) FROM orders 
+            WHERE status = 'approved' AND created_at >= ? AND created_at <= ?
+            """,
+            (start_utc, end_utc),
+        ).fetchone()[0] or 0
+
+        today_stars = conn.execute(
+            """
+            SELECT SUM(final_price_stars) FROM orders 
+            WHERE status = 'approved' AND created_at >= ? AND created_at <= ?
+            """,
+            (start_utc, end_utc),
+        ).fetchone()[0] or 0
+
+        return {
+            "users_count": users_count,
+            "total_orders": total_orders,
+            "approved_orders": approved_orders,
+            "revenue_rub": rev_rub,
+            "revenue_stars": rev_stars,
+            "today_orders": today_orders,
+            "today_approved": today_approved,
+            "today_revenue_rub": today_rub,
+            "today_revenue_stars": today_stars,
+        }
+
+
+def get_all_user_ids() -> list[int]:
+    with get_db() as conn:
+        rows = conn.execute("SELECT user_id FROM users").fetchall()
+        return [row["user_id"] for row in rows]
+
+# ==============================================================================
+# FSM СОСТОЯНИЯ
+# ==============================================================================
+
+class BuyFlow(StatesGroup):
+    category = State()
+    product_id = State()
+    quantity = State()
+    payment_method = State()
+    promo_code = State()
+    custom_details = State()
+    confirmation = State()
+
+
+class QuickAddProduct(StatesGroup):
+    waiting_for_input = State()
+
+
+class QuickAddStarsProduct(StatesGroup):
+    waiting_for_input = State()
+
+
+class EditProductStock(StatesGroup):
+    product_id = State()
+    waiting_for_value = State()
+
+
+class EditProductPrices(StatesGroup):
+    product_id = State()
+    waiting_for_value = State()
+
+
+class EditProductContent(StatesGroup):
+    product_id = State()
+    waiting_for_content = State()
+
+
+class AdminPromo(StatesGroup):
+    code = State()
+    discount = State()
+    max_uses = State()
+
+
+class Broadcast(StatesGroup):
+    message = State()
+    confirmation = State()
+
+# ==============================================================================
+# ХЭНДЛЕРЫ: СТАРТ И ОСНОВНОЕ МЕНЮ
+# ==============================================================================
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    save_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    show_admin = is_owner(message.from_user.id)
+    text = (
+        f"👋 Привет, <b>{html.escape(message.from_user.first_name)}</b>!\n\n"
+        "Добро пожаловать в наш магазин цифровых товаров.\n"
+        "Воспользуйтесь меню ниже для выбора категории."
+    )
+    await message.answer(text, reply_markup=main_menu_keyboard(show_admin))
+
+
+@router.callback_query(F.data == "check_subscription")
+async def check_sub_callback(callback: CallbackQuery, bot: Bot):
+    if await is_subscribed(bot, callback.from_user.id):
+        await callback.answer("✅ Подписка подтверждена!", show_alert=True)
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        show_admin = is_owner(callback.from_user.id)
+        await callback.message.answer(
+            "🎉 Спасибо за подписку! Теперь вам доступен функционал бота.",
+            reply_markup=main_menu_keyboard(show_admin)
+        )
+    else:
+        await callback.answer("❌ Вы всё ещё не подписаны на канал!", show_alert=True)
+
+
+@router.message(F.text == "📝 Отзывы")
+async def show_reviews(message: Message):
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="💬 Читать отзывы", url=REVIEWS_CHANNEL_URL)]]
+    )
+    await message.answer("⭐ Отзывы наших клиентов доступны на канале:", reply_markup=kb)
+
+
+@router.message(F.text == "👨‍💻 Поддержка")
+async def show_support(message: Message):
+    text = (
+        "👨‍💻 <b>Служба поддержки</b>\n\n"
+        f"По всем вопросам и проблемам с заказами пишите: @{SUPPORT_USERNAME}"
+    )
+    await message.answer(text)
+# ==============================================================================
+# ХЭНДЛЕРЫ: КАТАЛОГ И ПОКУПКА
+# ==============================================================================
+
+@router.message(F.text.in_({"🛒 Купить аккаунты", "⭐ Купить Stars", "💎 Купить Premium"}))
+async def start_category_flow(message: Message, state: FSMContext):
+    await state.clear()
+    cat_map = {
+        "🛒 Купить аккаунты": "accounts",
+        "⭐ Купить Stars": "stars",
+        "💎 Купить Premium": "premium",
+    }
+    category = cat_map[message.text]
+    products = get_products(category)
+
+    if not products:
+        await message.answer("😔 В данной категории пока нет доступных товаров.")
+        return
+
+    builder = InlineKeyboardBuilder()
+    for prod in products:
+        stock_str = stock_label(prod)
+        if not product_can_buy(prod):
+            btn_text = f"❌ {prod['title']} — Нет в наличии"
+        else:
+            btn_text = f"{prod['title']} | {product_prices(prod)} | {stock_str}"
+        builder.button(text=btn_text, callback_data=f"buy_prod:{prod['id']}")
+
+    builder.adjust(1)
+    title = category_title(category)
+    await message.answer(f"<b>{title}</b>\n\nВыберите товар для покупки:", reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("buy_prod:"))
+async def process_product_selection(callback: CallbackQuery, state: FSMContext):
+    prod_id = int(callback.data.split(":")[1])
+    product = get_product(prod_id)
+
+    if not product:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+
+    if not product_can_buy(product):
+        await callback.answer("❌ Данного товара нет в наличии!", show_alert=True)
+        return
+
+    await state.update_data(
+        product_id=product["id"],
+        category=product["category"],
+        product_title=product["title"],
+        price_rub=product["price_rub"],
+        price_stars=product["price_stars"],
+        unit_amount=product_unit_amount(product),
+        available=product_available(product),
+        star_delivery_method=product["star_delivery_method"],
+        item_content=product["item_content"] or "",
+    )
+
+    if product["category"] == "accounts":
+        await state.set_state(BuyFlow.quantity)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="1 шт", callback_data="qty:1"),
+                InlineKeyboardButton(text="2 шт", callback_data="qty:2"),
+                InlineKeyboardButton(text="5 шт", callback_data="qty:5"),
+            ],
+            [
+                InlineKeyboardButton(text="10 шт", callback_data="qty:10"),
+                InlineKeyboardButton(text="20 шт", callback_data="qty:20"),
+            ]
+        ])
+        await callback.message.edit_text(
+            f"🛒 Вы выбрали: <b>{html.escape(product['title'])}</b>\n"
+            f"Цена за 1 шт: <b>{product_prices(product)}</b>\n"
+            f"В наличии: <b>{product['available']} шт.</b>\n\n"
+            "Укажите количество для покупки (выберите кнопку или введите числом):",
+            reply_markup=kb,
+        )
+    else:
+        # Для Stars и Premium количество строго 1 комплект
+        await state.update_data(quantity=1)
+        await show_payment_methods(callback.message, state)
+
+
+@router.callback_query(F.data.startswith("qty:"))
+async def process_qty_callback(callback: CallbackQuery, state: FSMContext):
+    qty = int(callback.data.split(":")[1])
+    await process_quantity_input(qty, callback.message, state)
+
+
+@router.message(BuyFlow.quantity)
+async def process_qty_message(message: Message, state: FSMContext):
+    qty = parse_quantity(message.text)
+    if not qty or qty <= 0:
+        await message.answer("❌ Пожалуйста, введите корректное число штук.")
+        return
+    await process_quantity_input(qty, message, state)
+
+
+async def process_quantity_input(qty: int, message: Message, state: FSMContext):
+    data = await state.get_data()
+    available = data["available"]
+
+    if qty > available:
+        await message.answer(f"❌ Запрошено {qty} шт., но в наличии только {available} шт.")
+        return
+
+    await state.update_data(quantity=qty)
+    await show_payment_methods(message, state)
+
+
+async def show_payment_methods(message: Message, state: FSMContext):
+    data = await state.get_data()
+    price_rub = data["price_rub"] * data["quantity"]
+    price_stars = data["price_stars"] * data["quantity"]
+
+    builder = InlineKeyboardBuilder()
+    if price_rub > 0:
+        builder.button(text=f"💳 Рубли ({money(price_rub)})", callback_data="pay_method:card")
+    if price_stars > 0:
+        builder.button(text=f"⭐ Stars ({stars(price_stars)})", callback_data="pay_method:stars")
+    builder.adjust(1)
+
+    await state.set_state(BuyFlow.payment_method)
+
+    text = (
+        f"📦 Товар: <b>{html.escape(data['product_title'])}</b>\n"
+        f"Количество: <b>{data['quantity']} шт.</b>\n\n"
+        "Выберите способ оплаты:"
+    )
+
+    if message.from_user.is_bot:
+        await safe_edit_text(message, text, reply_markup=builder.as_markup())
+    else:
+        await message.answer(text, reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("pay_method:"))
+async def process_payment_method(callback: CallbackQuery, state: FSMContext):
+    method = callback.data.split(":")[1]
+    await state.update_data(payment_method=method)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎟 Ввести промокод", callback_data="enter_promo"),
+            InlineKeyboardButton(text="➡️ Пропустить", callback_data="skip_promo"),
+        ]
+    ])
+    await state.set_state(BuyFlow.promo_code)
+    await callback.message.edit_text("Есть ли у вас промокод на скидку?", reply_markup=kb)
+
+
+@router.callback_query(F.data == "enter_promo")
+async def ask_promo_code(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введите ваш промокод:")
+
+
+@router.callback_query(F.data == "skip_promo")
+async def skip_promo_code(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(promo_code=None, discount_percent=0)
+    await check_custom_details_needed(callback.message, state)
+
+
+@router.message(BuyFlow.promo_code)
+async def process_promo_input(message: Message, state: FSMContext):
+    promo = get_promo(message.text)
+    if not promo:
+        await message.answer("❌ Промокод не найден или неактивен. Попробуйте еще раз или напишите /start для отмены.")
+        return
+
+    if promo["current_uses"] >= promo["max_uses"]:
+        await message.answer("❌ Лимит использования этого промокода исчерпан.")
+        return
+
+    discount = promo["discount_percent"]
+    await state.update_data(promo_code=promo["code"], discount_percent=discount)
+    await message.answer(f"✅ Промокод <b>{promo['code']}</b> применён! Скидка: {discount}%.")
+    await check_custom_details_needed(message, state)
+
+
+async def check_custom_details_needed(message: Message, state: FSMContext):
+    data = await state.get_data()
+    category = data["category"]
+
+    if category in {"stars", "premium"}:
+        await state.set_state(BuyFlow.custom_details)
+        prompt = (
+            "Укажите ваш @username или ссылкой на профиль (куда отправлять товар):"
+            if category == "stars" else
+            "Укажите @username (или ссылку на профиль), кому дарить Premium:"
+        )
+        if message.from_user.is_bot:
+            await message.edit_text(prompt)
+        else:
+            await message.answer(prompt)
+    else:
+        await state.update_data(custom_details="—")
+        await show_order_confirmation(message, state)
+
+
+@router.message(BuyFlow.custom_details)
+async def process_custom_details(message: Message, state: FSMContext):
+    details = message.text.strip()
+    if not details:
+        await message.answer("❌ Пожалуйста, укажите контактные данные.")
+        return
+    await state.update_data(custom_details=details)
+    await show_order_confirmation(message, state)
+
+
+async def show_order_confirmation(message: Message, state: FSMContext):
+    data = await state.get_data()
+
+    qty = data["quantity"]
+    orig_rub = data["price_rub"] * qty
+    orig_stars = data["price_stars"] * qty
+    discount = data.get("discount_percent", 0)
+
+    final_rub = int(orig_rub * (1 - discount / 100))
+    final_stars = int(orig_stars * (1 - discount / 100))
+
+    await state.update_data(
+        orig_rub=orig_rub,
+        orig_stars=orig_stars,
+        final_rub=final_rub,
+        final_stars=final_stars,
+    )
+
+    pay_label = PAYMENT_METHOD_LABELS.get(data["payment_method"], data["payment_method"])
+    total_price_str = money(final_rub) if data["payment_method"] == "card" else stars(final_stars)
+
+    text = (
+        "📋 <b>Подтверждение заказа</b>\n\n"
+        f"📦 Товар: <b>{html.escape(data['product_title'])}</b>\n"
+        f"Количество: <b>{qty} шт.</b>\n"
+        f"💳 Способ оплаты: <b>{pay_label}</b>\n"
+    )
+    if discount > 0:
+        text += f"🎟 Промокод: <b>{data['promo_code']}</b> (-{discount}%)\n"
+
+    text += f"💰 Итого к оплате: <b>{total_price_str}</b>\n"
+
+    if data.get("custom_details") != "—":
+        text += f"🎯 Детали выдачи: <b>{html.escape(data['custom_details'])}</b>\n"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить и перейти к оплате", callback_data="confirm_order"),
+        ],
+        [
+            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_order"),
+        ]
+    ])
+
+    await state.set_state(BuyFlow.confirmation)
+    if message.from_user.is_bot:
+        await safe_edit_text(message, text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "cancel_order", BuyFlow.confirmation)
+async def cancel_order_flow(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ Заказ отменён.")
+
+
+@router.callback_query(F.data == "confirm_order", BuyFlow.confirmation)
+async def finalize_order_and_show_requisites(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    user = callback.from_user
+    user_display = safe_username(user.username, user.id)
+
+    order_id = create_order(
+        user_id=user.id,
+        user_display=user_display,
+        category=data["category"],
+        product_id=data["product_id"],
+        product_title=data["product_title"],
+        quantity=data["quantity"],
+        payment_method=data["payment_method"],
+        orig_rub=data["orig_rub"],
+        orig_stars=data["orig_stars"],
+        final_rub=data["final_rub"],
+        final_stars=data["final_stars"],
+        promo_code=data.get("promo_code"),
+        details=data.get("custom_details", "—"),
+        item_content=data.get("item_content", ""),
+    )
+
+    await state.clear()
+
+    # Формируем сообщение с реквизитами для покупателя
+    if data["payment_method"] == "card":
+        req_text = (
+            f"🛒 <b>Заказ #{order_id} создан!</b>\n\n"
+            f"Сумма к оплате: <b>{money(data['final_rub'])}</b>\n\n"
+            f"💳 <b>Реквизиты для перевода:</b>\n"
+            f"Банк: <b>{T_BANK_NAME}</b>\n"
+            f"Номер карты: <code>{T_BANK_CARD_NUMBER}</code>\n"
+            f"Получатель: <b>{T_BANK_RECIPIENT}</b>\n\n"
+            "⚠️ Переведите точную сумму. После оплаты нажмите кнопку ниже."
+        )
+    else:
+        req_text = (
+            f"🛒 <b>Заказ #{order_id} создан!</b>\n\n"
+            f"Сумма к оплате: <b>{stars(data['final_stars'])}</b>\n\n"
+            f"⭐ Отправьте <b>{data['final_stars']} Stars</b> на профиль: @{STARS_RECEIVER_USERNAME}\n\n"
+            "⚠️ После отправки звезд нажмите кнопку ниже для проверки."
+        )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"user_paid:{order_id}")]
+    ])
+
+    await callback.message.edit_text(req_text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("user_paid:"))
+async def user_paid_notification(callback: CallbackQuery, bot: Bot):
+    order_id = int(callback.data.split(":")[1])
+    order = get_order(order_id)
+
+    if not order:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"⏳ <b>Заказ #{order_id} отправлен на проверку!</b>\n\n"
+        "Администратор проверяет поступивший платеж. После проверки вам придет уведомление."
+    )
+
+    # Уведомление администратору
+    admin_text = (
+        f"🚨 <b>НОВЫЙ ОПЛАЧЕННЫЙ ЗАКАЗ #{order['id']}</b>\n\n"
+        f"Покупатель: {order['user_display']} (ID: <code>{order['user_id']}</code>)\n"
+        f"Товар: <b>{html.escape(order['product_title'])}</b>\n"
+        f"Количество: <b>{order['quantity']} шт.</b>\n"
+        f"Сумма: <b>{order_amount(order)}</b> ({order['payment_method']})\n"
+        f"Детали: <b>{html.escape(order['details'])}</b>\n"
+        f"Время: {format_datetime(order['created_at'])}\n"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Выдать / Подтвердить", callback_data=f"adm_appr:{order['id']}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_canc:{order['id']}"),
+        ]
+    ])
+
+    try:
+        await bot.send_message(OWNER_ID, admin_text, reply_markup=kb)
+    except Exception as e:
+        logger.error(f"Не удалось отправить уведомление админу: {e}")
+# ==============================================================================
+# ХЭНДЛЕРЫ: АДМИН-ПАНЕЛЬ И УПРАВЛЕНИЕ
+# ==============================================================================
+
+@router.message(F.text == "⚙️ Админ-панель")
+async def show_admin_panel(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    text = "⚙️ <b>Панель администратора</b>\n\nВыберите нужный раздел:"
+    await message.answer(text, reply_markup=admin_menu_keyboard())
+
+
+@router.callback_query(F.data == "admin:main")
+async def back_to_admin_main(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        return
+    await safe_edit_text(
+        callback.message,
+        "⚙️ <b>Панель администратора</b>\n\nВыберите нужный раздел:",
+        reply_markup=admin_menu_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "admin:stats")
+async def show_admin_stats(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        return
+    stats = get_statistics()
+
+    text = (
+        "📊 <b>Статистика магазина</b>\n\n"
+        f"👥 Всего пользователей: <b>{stats['users_count']}</b>\n\n"
+        "<b>За всё время:</b>\n"
+        f"▪ Всего заказов: <b>{stats['total_orders']}</b>\n"
+        f"▪ Успешных: <b>{stats['approved_orders']}</b>\n"
+        f"▪ Выручка (₽): <b>{money(stats['revenue_rub'])}</b>\n"
+        f"▪ Выручка (⭐): <b>{stars(stats['revenue_stars'])}</b>\n\n"
+        "<b>За сегодня:</b>\n"
+        f"▪ Заказов: <b>{stats['today_orders']}</b>\n"
+        f"▪ Успешных: <b>{stats['today_approved']}</b>\n"
+        f"▪ Выручка (₽): <b>{money(stats['today_revenue_rub'])}</b>\n"
+        f"▪ Выручка (⭐): <b>{stars(stats['today_revenue_stars'])}</b>\n"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:main")]
+    ])
+    await safe_edit_text(callback.message, text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin:stock")
+async def show_admin_stock(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        return
+
+    with get_db() as conn:
+        products = conn.execute("SELECT * FROM products ORDER BY category, id").fetchall()
+
+    builder = InlineKeyboardBuilder()
+    for prod in products:
+        builder.button(
+            text=f"✏️ {prod['title']} ({prod['available']} шт.)",
+            callback_data=f"adm_prod:{prod['id']}",
+        )
+
+    builder.button(text="➕ Быстро добавить аккаунт", callback_data="adm_add:quick")
+    builder.button(text="⭐ Добавить пакет Stars", callback_data="adm_add:stars")
+    builder.button(text="⬅️ Назад", callback_data="admin:main")
+    builder.adjust(1)
+
+    text = "📦 <b>Управление складом и товарами</b>\n\nНажмите на товар для редактирования:"
+    await safe_edit_text(callback.message, text, reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("adm_prod:"))
+async def edit_product_menu(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        return
+
+    prod_id = int(callback.data.split(":")[1])
+    product = get_product(prod_id)
+
+    if not product:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+
+    lines = (product["item_content"] or "").strip().split("\n")
+    items_count = len([l for l in lines if l.strip()])
+
+    text = (
+        f"⚙️ <b>Редактирование товара</b>\n\n"
+        f"📌 Название: <b>{html.escape(product['title'])}</b>\n"
+        f"📁 Категория: <code>{product['category']}</code>\n"
+        f"💰 Цены: <b>{product_prices(product)}</b>\n"
+        f"📦 Остаток (в поле): <b>{product['available']} шт.</b>\n"
+        f"📄 Загружено строк выдачи: <b>{items_count} шт.</b>\n"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить остаток", callback_data=f"edit_stock:{product['id']}")],
+        [InlineKeyboardButton(text="💰 Изменить цены", callback_data=f"edit_prices:{product['id']}")],
+        [InlineKeyboardButton(text="📥 Загрузить строки товара (аккаунты)", callback_data=f"edit_content:{product['id']}")],
+        [InlineKeyboardButton(text="🗑 Удалить товар", callback_data=f"delete_prod:{product['id']}")],
+        [InlineKeyboardButton(text="⬅️ Назад к складу", callback_data="admin:stock")],
+    ])
+
+    await safe_edit_text(callback.message, text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("edit_stock:"))
+async def start_edit_stock(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        return
+    prod_id = int(callback.data.split(":")[1])
+    await state.update_data(edit_product_id=prod_id)
+    await state.set_state(EditProductStock.waiting_for_value)
+    await callback.message.answer("Введите новое количество товара на складе (число):")
+
+
+@router.message(EditProductStock.waiting_for_value)
+async def process_new_stock(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    try:
+        val = int(message.text.strip())
+        data = await state.get_data()
+        update_product_stock(data["edit_product_id"], val)
+        await state.clear()
+        await message.answer("✅ Остаток обновлен!")
+    except ValueError:
+        await message.answer("❌ Введите корректное целое число.")
+
+
+@router.callback_query(F.data.startswith("edit_prices:"))
+async def start_edit_prices(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        return
+    prod_id = int(callback.data.split(":")[1])
+    await state.update_data(edit_product_id=prod_id)
+    await state.set_state(EditProductPrices.waiting_for_value)
+    await callback.message.answer(
+        "Введите новые цены в формате:\n<code>рубли / stars</code> (например: <code>100 / 50</code> или <code>150</code>)"
+    )
+
+
+@router.message(EditProductPrices.waiting_for_value)
+async def process_new_prices(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    parsed = parse_prices(message.text)
+    if not parsed:
+        await message.answer("❌ Неверный формат. Попробуйте еще раз (например: 100 / 50):")
+        return
+
+    data = await state.get_data()
+    set_product_prices(data["edit_product_id"], parsed[0], parsed[1])
+    await state.clear()
+    await message.answer("✅ Цены успешно обновлены!")
+
+
+@router.callback_query(F.data.startswith("edit_content:"))
+async def start_edit_content(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        return
+    prod_id = int(callback.data.split(":")[1])
+    await state.update_data(edit_product_id=prod_id)
+    await state.set_state(EditProductContent.waiting_for_content)
+    await callback.message.answer(
+        "📥 <b>Отправьте список аккаунтов/товаров для выдачи</b>\n\n"
+        "Каждая строка = 1 товар/аккаунт (логин:пароль, ссылка и т.д.).\n"
+        "<i>Новые строки добавятся к уже существующим. Остаток товара автоматически увеличится.</i>"
+    )
+
+
+@router.message(EditProductContent.waiting_for_content)
+async def process_new_content(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    new_items = message.text.strip().split("\n")
+    cleaned_items = [item.strip() for item in new_items if item.strip()]
+
+    if not cleaned_items:
+        await message.answer("❌ Вы не отправили ни одной строки.")
+        return
+
+    data = await state.get_data()
+    prod_id = data["edit_product_id"]
+    product = get_product(prod_id)
+
+    if product:
+        current_content = (product["item_content"] or "").strip()
+        updated_content = (current_content + "\n" + "\n".join(cleaned_items)).strip()
+        new_stock = product["available"] + len(cleaned_items)
+
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE products SET item_content = ?, available = ? WHERE id = ?",
+                (updated_content, new_stock, prod_id),
+            )
+
+        await state.clear()
+        await message.answer(
+            f"✅ Успешно добавлено строк: <b>{len(cleaned_items)}</b>.\n"
+            f"📦 Новый остаток товара: <b>{new_stock} шт.</b>"
+        )
+
+
+@router.callback_query(F.data.startswith("delete_prod:"))
+async def delete_product_callback(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        return
+    prod_id = int(callback.data.split(":")[1])
+    delete_product(prod_id)
+    await callback.answer("Товар удален", show_alert=True)
+    await show_admin_stock(callback)
+# ==============================================================================
+# БЫСТРОЕ ДОБАВЛЕНИЕ ТОВАРОВ И ЗВЕЗД
+# ==============================================================================
+
+@router.callback_query(F.data == "adm_add:quick")
+async def start_quick_add(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        return
+    await state.set_state(QuickAddProduct.waiting_for_input)
+    text = (
+        "➕ <b>Быстрое добавление товара (Аккаунты)</b>\n\n"
+        "Отправьте данные в формате:\n"
+        "<code>Подкатегория | Название | Цена Руб / Stars | Количество</code>\n\n"
+        "Пример:\n"
+        "<code>Telegram | TG Premium Accounts | 150 / 80 | 10</code>"
+    )
+    await callback.message.answer(text)
+
+
+@router.message(QuickAddProduct.waiting_for_input)
+async def process_quick_add(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+
+    parts = [p.strip() for p in message.text.split("|")]
+    if len(parts) < 4:
+        await message.answer("❌ Неверный формат. Нужно 4 параметра через '|'. Попробуйте снова:")
+        return
+
+    subcat, title, price_str, stock_str = parts[0], parts[1], parts[2], parts[3]
+    prices = parse_prices(price_str)
+    if not prices:
+        await message.answer("❌ Ошибка в формате цен. Попробуйте снова:")
+        return
+
+    try:
+        stock = int(stock_str)
+    except ValueError:
+        await message.answer("❌ Количество должно быть числом. Попробуйте снова:")
+        return
+
+    rub, star = prices
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO products (
+                category, subcategory, title, price_rub, price_stars, available, unit_amount, star_delivery_method, item_content
+            ) VALUES ('accounts', ?, ?, ?, ?, ?, 1, 'standard', '')
+            """,
+            (subcat, title, rub, star, stock),
+        )
+
+    await state.clear()
+    await message.answer(f"✅ Товар <b>{html.escape(title)}</b> успешно добавлен!")
+
+
+@router.callback_query(F.data == "adm_add:stars")
+async def start_quick_add_stars(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        return
+    await state.set_state(QuickAddStarsProduct.waiting_for_input)
+    text = (
+        "⭐ <b>Добавление пакета Stars</b>\n\n"
+        "Отправьте данные в формате:\n"
+        "<code>Название | Количество звезд | Цена Руб / Stars</code>\n\n"
+        "Пример:\n"
+        "<code>100 Stars | 100 | 180 / 100</code>"
+    )
+    await callback.message.answer(text)
+
+
+@router.message(QuickAddStarsProduct.waiting_for_input)
+async def process_quick_add_stars(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+
+    parts = [p.strip() for p in message.text.split("|")]
+    if len(parts) < 3:
+        await message.answer("❌ Неверный формат. Нужно 3 параметра через '|'. Попробуйте снова:")
+        return
+
+    title, stars_cnt_str, price_str = parts[0], parts[1], parts[2]
+    prices = parse_prices(price_str)
+    if not prices:
+        await message.answer("❌ Ошибка в формате цен. Попробуйте снова:")
+        return
+
+    try:
+        unit_amount = int(stars_cnt_str)
+    except ValueError:
+        await message.answer("❌ Количество звезд должно быть числом. Попробуйте снова:")
+        return
+
+    rub, star = prices
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO products (
+                category, subcategory, title, price_rub, price_stars, available, unit_amount, star_delivery_method, item_content
+            ) VALUES ('stars', 'Telegram Stars', ?, ?, ?, 9999, ?, 'standard', '')
+            """,
+            (title, rub, star, unit_amount),
+        )
+
+    await state.clear()
+    await message.answer(f"✅ Пакет Stars <b>{html.escape(title)}</b> успешно добавлен!")
+
+
+# ==============================================================================
+# ПОДТВЕРЖДЕНИЕ ЗАКАЗОВ И АВТОВЫДАЧА (АДМИН)
+# ==============================================================================
+
+@router.callback_query(F.data.startswith("adm_appr:"))
+async def approve_order_callback(callback: CallbackQuery, bot: Bot):
+    if not is_owner(callback.from_user.id):
+        return
+
+    order_id = int(callback.data.split(":")[1])
+    order = get_order(order_id)
+
+    if not order:
+        await callback.answer("Заказ не найден!", show_alert=True)
+        return
+
+    if order["status"] == "approved":
+        await callback.answer("Заказ уже подтвержден!", show_alert=True)
+        return
+
+    update_order_status(order_id, "approved")
+
+    product = get_product(order["product_id"]) if order["product_id"] else None
+    delivered_content = ""
+
+    # Выдача цифрового товара (если это аккаунты из базы)
+    if product and product["item_content"]:
+        lines = [line.strip() for line in product["item_content"].strip().split("\n") if line.strip()]
+        qty_needed = order["quantity"]
+
+        if len(lines) >= qty_needed:
+            issued_items = lines[:qty_needed]
+            remaining_items = lines[qty_needed:]
+            delivered_content = "\n".join(issued_items)
+
+            new_content = "\n".join(remaining_items)
+            new_stock = max(0, product["available"] - qty_needed)
+
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE products SET item_content = ?, available = ? WHERE id = ?",
+                    (new_content, new_stock, product["id"]),
+                )
+                conn.execute(
+                    "UPDATE orders SET item_content = ? WHERE id = ?",
+                    (delivered_content, order_id),
+                )
+
+    # Формируем уведомление для покупателя
+    user_msg = f"🎉 <b>Ваш заказ #{order['id']} успешно подтвержден!</b>\n\n"
+    user_msg += f"📦 Товар: <b>{html.escape(order['product_title'])}</b>\n"
+
+    if delivered_content:
+        user_msg += f"\n🔑 <b>Ваши данные для доступа:</b>\n<code>{delivered_content}</code>\n"
+    else:
+        user_msg += f"\nДетали / получатель: <b>{html.escape(order['details'])}</b>\n"
+        user_msg += "Менеджер выполнит отправку услугу/звезды на указанные реквизиты в ближайшее время."
+
+    user_msg += "\nСпасибо за покупку!"
+
+    try:
+        await bot.send_message(order["user_id"], user_msg)
+        await callback.message.edit_text(callback.message.text + f"\n\n✅ <b>ЗАКАЗ #{order_id} ПОДТВЕРЖДЕН</b>")
+    except Exception as e:
+        logger.error(f"Ошибка при отправке уведомления пользователю {order['user_id']}: {e}")
+        await callback.answer("Статус изменен, но не удалось отправить сообщение пользователю", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("adm_canc:"))
+async def cancel_order_admin_callback(callback: CallbackQuery, bot: Bot):
+    if not is_owner(callback.from_user.id):
+        return
+
+    order_id = int(callback.data.split(":")[1])
+    order = get_order(order_id)
+
+    if not order:
+        await callback.answer("Заказ не найден!", show_alert=True)
+        return
+
+    update_order_status(order_id, "cancelled")
+
+    try:
+        await bot.send_message(
+            order["user_id"],
+            f"❌ Ваш заказ #{order['id']} отменен администратором.\nЕсли возникла ошибка, обратитесь в поддержку: @{SUPPORT_USERNAME}",
+        )
+        await callback.message.edit_text(callback.message.text + f"\n\n❌ <b>ЗАКАЗ #{order_id} ОТМЕНЕН</b>")
+    except Exception as e:
+        logger.error(f"Не удалось уведомить пользователя об отмене: {e}")
+
+
+# ==============================================================================
+# ПРОМОКОДЫИ РАССЫЛКА
+# ==============================================================================
+
+@router.callback_query(F.data == "admin:promos")
+async def show_admin_promos(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        return
+
+    promos = get_all_promos()
+    builder = InlineKeyboardBuilder()
+
+    text = "🎟 <b>Управление промокодами</b>\n\n"
+    if not promos:
+        text += "Промокодов пока нет."
+    else:
+        for p in promos:
+            status = "🟢" if p["is_active"] else "🔴"
+            text += f"{status} <b>{p['code']}</b> — {p['discount_percent']}% ({p['current_uses']}/{p['max_uses']})\n"
+            builder.button(
+                text=f"{'Вкл' if not p['is_active'] else 'Выкл'} {p['code']}",
+                callback_data=f"toggle_promo:{p['id']}",
+            )
+
+    builder.button(text="➕ Создать промокод", callback_data="add_promo")
+    builder.button(text="⬅️ Назад", callback_data="admin:main")
+    builder.adjust(1)
+
+    await safe_edit_text(callback.message, text, reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("toggle_promo:"))
+async def toggle_promo_callback(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        return
+    promo_id = int(callback.data.split(":")[1])
+    toggle_promo_status(promo_id)
+    await show_admin_promos(callback)
+
+
+@router.callback_query(F.data == "add_promo")
+async def start_add_promo(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        return
+    await state.set_state(AdminPromo.code)
+    await callback.message.answer("Введите код нового промокода (например: <code>SALE20</code>):")
+
+
+@router.message(AdminPromo.code)
+async def process_promo_code_step(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    await state.update_data(code=message.text.strip().upper())
+    await state.set_state(AdminPromo.discount)
+    await message.answer("Введите процент скидки (от 1 до 99):")
+
+
+@router.message(AdminPromo.discount)
+async def process_promo_discount_step(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    try:
+        val = int(message.text.strip())
+        if not (1 <= val <= 99):
+            raise ValueError()
+        await state.update_data(discount=val)
+        await state.set_state(AdminPromo.max_uses)
+        await message.answer("Введите максимальное количество активаций:")
+    except ValueError:
+        await message.answer("❌ Введите целое число от 1 до 99.")
+
+
+@router.message(AdminPromo.max_uses)
+async def process_promo_max_uses_step(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    try:
+        max_uses = int(message.text.strip())
+        data = await state.get_data()
+        success = create_promo(data["code"], data["discount"], max_uses)
+        await state.clear()
+
+        if success:
+            await message.answer(f"✅ Промокод <b>{data['code']}</b> успешно создан!")
+        else:
+            await message.answer("❌ Промокод с таким кодом уже существует.")
+    except ValueError:
+        await message.answer("❌ Введите корректное число.")
+
+
+@router.callback_query(F.data == "admin:broadcast")
+async def start_broadcast(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        return
+    await state.set_state(Broadcast.message)
+    await callback.message.answer("📢 Введите текст сообщения для рассылки всем пользователям:")
+
+
+@router.message(Broadcast.message)
+async def process_broadcast_message(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    await state.update_data(broadcast_text=message.text)
+    await state.set_state(Broadcast.confirmation)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🚀 Запустить", callback_data="confirm_broadcast"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_broadcast"),
+        ]
+    ])
+    await message.answer(f"Подтвердите рассылку текста:\n\n{message.text}", reply_markup=kb)
+
+
+@router.callback_query(F.data == "confirm_broadcast", Broadcast.confirmation)
+async def run_broadcast(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if not is_owner(callback.from_user.id):
+        return
+
+    data = await state.get_data()
+    text = data["broadcast_text"]
+    await state.clear()
+
+    user_ids = get_all_user_ids()
+    await callback.message.edit_text(f"🚀 Начинаю рассылку на {len(user_ids)} пользователей...")
+
+    success, fail = 0, 0
+    for uid in user_ids:
+        try:
+            await bot.send_message(uid, text)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            fail += 1
+
+    await callback.message.answer(f"✅ Рассылка завершена!\n\nУспешно: <b>{success}</b>\nОшибок: <b>{fail}</b>")
+
+
+@router.callback_query(F.data == "cancel_broadcast", Broadcast.confirmation)
+async def cancel_broadcast(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ Рассылка отменена.")
+
+
+# ==============================================================================
+# ЗАПУСК БОТА
+# ==============================================================================
+
+async def main():
+    logger.info("Инициализация базы данных...")
+    init_db()
+
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
+
+    # Регистрация промежуточных ПО (Middleware)
+    dp.message.outer_middleware(SubscriptionMiddleware())
+    dp.callback_query.outer_middleware(SubscriptionMiddleware())
+
+    dp.include_router(router)
+
+    logger.info("Бот запущен и готов к работе!")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен!")
